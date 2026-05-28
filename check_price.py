@@ -5,9 +5,10 @@ import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-EMAIL_SENDER   = os.environ.get("EMAIL_SENDER")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
+EMAIL_SENDER      = os.environ.get("EMAIL_SENDER")
+EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD")
+EMAIL_RECEIVER    = os.environ.get("EMAIL_RECEIVER")
+SCRAPER_API_KEY   = os.environ.get("SCRAPER_API_KEY")
 DISCOUNT_THRESHOLD = 50
 
 PRODUCTS = [
@@ -17,63 +18,44 @@ PRODUCTS = [
     },
 ]
 
-HEADERS_LIST = [
-    {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1", "Accept-Language": "de-DE,de;q=0.9"},
-    {"User-Agent": "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36", "Accept-Language": "de-DE"},
-    {"User-Agent": "Googlebot/2.1 (+http://www.google.com/bot.html)"},
-    {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"},
-]
+def get_page(url):
+    """دریافت صفحه از طریق ScraperAPI"""
+    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={url}&country_code=de"
+    r = requests.get(api_url, timeout=60)
+    print(f"  ScraperAPI status: {r.status_code}, size: {len(r.text)}")
+    return r.text if r.status_code == 200 else None
 
-def get_discount(url):
-    for i, headers in enumerate(HEADERS_LIST):
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            print(f"  Headers {i+1}: status={r.status_code}, size={len(r.text)}")
-            
-            if r.status_code != 200:
-                continue
+def parse_discount(html):
+    # روش ۱: بج تخفیف -XX%
+    badges = re.findall(r'-\s*(\d+)\s*%', html)
+    if badges:
+        discount = max(int(d) for d in badges)
+        print(f"  بج تخفیف پیدا شد: {discount}%")
+        
+        # قیمت‌ها
+        prices = re.findall(r'(\d+)[,\.](\d{2})\s*€', html)
+        price_vals = sorted(set(float(f"{p[0]}.{p[1]}") for p in prices))
+        print(f"  قیمت‌های پیدا شده: {price_vals}")
+        
+        if len(price_vals) >= 2:
+            return {"discount": discount, "sale": min(price_vals), "original": max(price_vals)}
+        elif price_vals:
+            original = price_vals[0]
+            sale = round(original * (1 - discount/100), 2)
+            return {"discount": discount, "sale": sale, "original": original}
 
-            # روش ۱: دنبال بج تخفیف -XX%
-            discount_badges = re.findall(r'-(\d+)\s*%', r.text)
-            if discount_badges:
-                discount = max(int(d) for d in discount_badges)
-                print(f"  ✅ تخفیف پیدا شد: {discount}%")
-                
-                # قیمت‌ها
-                prices = re.findall(r'(\d+[,\.]\d{2})\s*[€&euro;]|[€&euro;]\s*(\d+[,\.]\d{2})', r.text)
-                price_values = []
-                for p in prices:
-                    val = p[0] or p[1]
-                    price_values.append(float(val.replace(',', '.')))
-                
-                price_values = sorted(set(price_values))
-                print(f"  قیمت‌های پیدا شده: {price_values}")
-                
-                if len(price_values) >= 2:
-                    return {"discount": discount, "sale": min(price_values), "original": max(price_values)}
-                elif price_values:
-                    original = price_values[0]
-                    sale = round(original * (1 - discount/100), 2)
-                    return {"discount": discount, "sale": sale, "original": original}
-            
-            # روش ۲: دو قیمت کنار هم (قیمت خط‌خورده)
-            struck = re.findall(r'<s[^>]*>.*?(\d+[,\.]\d{2}).*?</s>', r.text)
-            current = re.findall(r'class="[^"]*sale[^"]*"[^>]*>.*?(\d+[,\.]\d{2})', r.text)
-            if struck and current:
-                original = float(struck[0].replace(',', '.'))
-                sale = float(current[0].replace(',', '.'))
-                if original > sale:
-                    discount = round((1 - sale/original) * 100)
-                    print(f"  ✅ تخفیف از قیمت خط‌خورده: {discount}%")
-                    return {"discount": discount, "sale": sale, "original": original}
-            
-            print(f"  ⏳ تخفیفی پیدا نشد")
-            return {"discount": 0, "sale": 0, "original": 0}
-            
-        except Exception as e:
-            print(f"  Headers {i+1} error: {e}")
-    
-    return None
+    # روش ۲: JSON-LD
+    ld = re.findall(r'"price":\s*"?([\d.]+)"?', html)
+    if len(ld) >= 2:
+        prices = sorted(set(float(p) for p in ld if float(p) > 1))
+        if len(prices) >= 2:
+            original, sale = max(prices), min(prices)
+            discount = round((1 - sale/original) * 100)
+            if discount > 0:
+                return {"discount": discount, "sale": sale, "original": original}
+
+    print("  تخفیفی پیدا نشد")
+    return {"discount": 0, "sale": 0, "original": 0}
 
 def send_email(product_name, product_url, original, sale, discount):
     msg = MIMEMultipart("alternative")
@@ -99,12 +81,13 @@ def main():
     print("🔍 بررسی قیمت‌های H&M...")
     for product in PRODUCTS:
         print(f"\n→ {product['name']}")
-        info = get_discount(product["url"])
-        if info is None:
-            print("  ❌ نتوانستم به سایت وصل شوم")
+        html = get_page(product["url"])
+        if not html:
+            print("  ❌ نتوانستم صفحه را دریافت کنم")
             continue
+        info = parse_discount(html)
         if info["discount"] == 0:
-            print(f"  ⏳ تخفیفی وجود ندارد")
+            print("  ⏳ تخفیفی وجود ندارد")
             continue
         print(f"  تخفیف: {info['discount']}% | {info['original']:.2f}€ → {info['sale']:.2f}€")
         if info["discount"] >= DISCOUNT_THRESHOLD:

@@ -1,4 +1,3 @@
-
 name: H&M Price Tracker
 on:
   schedule:
@@ -16,10 +15,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: |
-          pip install playwright
-          playwright install chromium
-          playwright install-deps chromium
+        run: pip install requests
       - name: Run price checker
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}

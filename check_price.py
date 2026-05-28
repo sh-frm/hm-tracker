@@ -15,8 +15,6 @@ PRODUCTS = [
     {
         "name": "4er-Pack Boxershorts",
         "url": "https://www2.hm.com/de_de/productpage.1296600003.html",
-        "min_price": 1.0,
-        "max_price": 35.0,
     },
 ]
 
@@ -26,32 +24,41 @@ def get_page(url):
     print(f"  ScraperAPI status: {r.status_code}")
     return r.text if r.status_code == 200 else None
 
-def parse_discount(html, min_price, max_price):
-    # بج تخفیف
-    badges = re.findall(r'-\s*(\d+)\s*%', html)
-    if not badges:
-        print("  بج تخفیفی پیدا نشد")
-        return {"discount": 0, "sale": 0, "original": 0}
+def parse_discount(html):
+    # دنبال بلوکی که هم % داره هم دو قیمت کنار هم (در ۵۰۰ کاراکتر)
+    # مثال: -20% ... 23,99 € ... 29,99 €
+    matches = list(re.finditer(r'-(\d{1,2})%', html))
     
-    discount = max(int(d) for d in badges)
-    print(f"  بج تخفیف: {discount}%")
-
-    # فقط قیمت‌های در بازه منطقی محصول
-    prices = re.findall(r'(\d+)[,\.](\d{2})\s*€', html)
-    price_vals = sorted(set(
-        float(f"{p[0]}.{p[1]}") for p in prices
-        if min_price <= float(f"{p[0]}.{p[1]}") <= max_price
-    ))
-    print(f"  قیمت‌های منطقی: {price_vals}")
-
-    if len(price_vals) >= 2:
-        return {"discount": discount, "sale": min(price_vals), "original": max(price_vals)}
-    elif len(price_vals) == 1:
-        original = price_vals[0]
-        sale = round(original * (1 - discount / 100), 2)
-        return {"discount": discount, "sale": sale, "original": original}
-
-    print("  نتوانستم قیمت را تشخیص دهم")
+    for m in matches:
+        start = max(0, m.start() - 100)
+        end = min(len(html), m.end() + 500)
+        chunk = html[start:end]
+        
+        discount = int(m.group(1))
+        if discount < 5 or discount > 95:
+            continue
+        
+        # پیدا کردن قیمت‌ها در همین بلوک
+        prices = re.findall(r'(\d+)[,\.](\d{2})\s*€', chunk)
+        price_vals = sorted(set(float(f"{p[0]}.{p[1]}") for p in prices))
+        
+        print(f"  بلوک با {discount}%: قیمت‌ها = {price_vals}")
+        
+        if len(price_vals) >= 2:
+            original = max(price_vals)
+            sale = min(price_vals)
+            # بررسی اینکه تخفیف با قیمت‌ها همخوانی داشته باشه
+            calc_discount = round((1 - sale/original) * 100)
+            if abs(calc_discount - discount) <= 10:  # تولرانس ۱۰٪
+                print(f"  ✅ قیمت اصلی: {original}€ | فروش: {sale}€ | تخفیف: {discount}%")
+                return {"discount": discount, "sale": sale, "original": original}
+        elif len(price_vals) == 1:
+            original = price_vals[0]
+            sale = round(original * (1 - discount/100), 2)
+            print(f"  ✅ قیمت اصلی: {original}€ | فروش محاسبه‌شده: {sale}€ | تخفیف: {discount}%")
+            return {"discount": discount, "sale": sale, "original": original}
+    
+    print("  تخفیفی پیدا نشد")
     return {"discount": 0, "sale": 0, "original": 0}
 
 def send_email(product_name, product_url, original, sale, discount):
@@ -82,16 +89,15 @@ def main():
         if not html:
             print("  ❌ نتوانستم صفحه را دریافت کنم")
             continue
-        info = parse_discount(html, product["min_price"], product["max_price"])
+        info = parse_discount(html)
         if info["discount"] == 0:
             print("  ⏳ تخفیفی وجود ندارد")
             continue
-        print(f"  تخفیف: {info['discount']}% | {info['original']:.2f}€ → {info['sale']:.2f}€")
         if info["discount"] >= DISCOUNT_THRESHOLD:
             print("  🎉 تخفیف کافی! ارسال ایمیل...")
             send_email(product["name"], product["url"], info["original"], info["sale"], info["discount"])
         else:
-            print(f"  ⏳ تخفیف کافی نیست (نیاز به {DISCOUNT_THRESHOLD}%+)")
+            print(f"  ⏳ تخفیف کافی نیست ({info['discount']}% < {DISCOUNT_THRESHOLD}%)")
     print("\n✅ بررسی تمام شد.")
 
 if __name__ == "__main__":

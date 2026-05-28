@@ -1,171 +1,140 @@
-import requests
 import smtplib
+import os
 import json
+import subprocess
+import sys
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import os
 
-# ═══════════════════════════════════════════
-#  تنظیمات - اینجا رو پر کن
-# ═══════════════════════════════════════════
-EMAIL_SENDER   = os.environ.get("EMAIL_SENDER")    # ایمیل Gmail فرستنده
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")  # App Password گوگل
-EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")  # ایمیل دریافت‌کننده
-DISCOUNT_THRESHOLD = 50                            # درصد تخفیف
+EMAIL_SENDER   = os.environ.get("EMAIL_SENDER")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
+DISCOUNT_THRESHOLD = 50
 
 PRODUCTS = [
     {
         "name": "4er-Pack Boxershorts",
         "url": "https://www2.hm.com/de_de/productpage.1296600003.html",
-        "product_id": "1296600003",
-        "target_size": "L",
+        "product_code": "1296600003",
     },
-    # محصول دوم رو اینجا اضافه کن (بعد از پیدا کردن ID اش)
-    # {
-    #     "name": "5er-Pack Boxershorts",
-    #     "url": "https://www2.hm.com/de_de/productpage.XXXXXXXXX.html",
-    #     "product_id": "XXXXXXXXX",
-    #     "target_size": "L",
-    # },
 ]
 
-# ═══════════════════════════════════════════
-#  دریافت اطلاعات قیمت از H&M API
-# ═══════════════════════════════════════════
-def get_product_info(product_id):
-    api_url = f"https://www2.hm.com/de_de/getJsonPageData.json?id={product_id}&category=boxershorts&page=productdetails"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "de-DE,de;q=0.9",
-    }
+SCRIPT = """
+import asyncio
+from playwright.async_api import async_playwright
+import json, re, sys
 
-    # روش اول: JSON API
-    try:
-        resp = requests.get(api_url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            return parse_api_response(data)
-    except Exception:
-        pass
+async def get_price(url):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            locale="de-DE",
+        )
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
+        
+        # دنبال قیمت در صفحه
+        content = await page.content()
+        
+        # روش ۱: JSON-LD
+        ld = re.findall(r'<script type="application/ld\\+json">(.*?)</script>', content, re.DOTALL)
+        for item in ld:
+            try:
+                d = json.loads(item)
+                offers = d.get("offers", {})
+                if isinstance(offers, list): offers = offers[0]
+                price = offers.get("price") or offers.get("lowPrice")
+                if price:
+                    print(json.dumps({"sale": float(price), "original": float(price)}))
+                    await browser.close()
+                    return
+            except: pass
+        
+        # روش ۲: متن قیمت در صفحه
+        try:
+            price_el = await page.query_selector('[class*="Price"] strong, [data-testid*="price"], .price')
+            if price_el:
+                text = await price_el.inner_text()
+                nums = re.findall(r'[\\d,\\.]+', text)
+                prices = [float(n.replace(',','.')) for n in nums if float(n.replace(',','.')) > 1]
+                if len(prices) >= 2:
+                    print(json.dumps({"original": max(prices), "sale": min(prices)}))
+                elif len(prices) == 1:
+                    print(json.dumps({"original": prices[0], "sale": prices[0]}))
+                await browser.close()
+                return
+        except: pass
+        
+        print(json.dumps({"error": "not found"}))
+        await browser.close()
 
-    # روش دوم: scrape مستقیم صفحه
+asyncio.run(get_price(sys.argv[1]))
+"""
+
+def get_price(product_url):
     try:
-        page_url = f"https://www2.hm.com/de_de/productpage.{product_id}.html"
-        resp = requests.get(page_url, headers=headers, timeout=15)
-        return parse_html_response(resp.text, product_id)
+        result = subprocess.run(
+            [sys.executable, "-c", SCRIPT, product_url],
+            capture_output=True, text=True, timeout=60
+        )
+        print(f"  stdout: {result.stdout.strip()}")
+        if result.stderr:
+            print(f"  stderr: {result.stderr.strip()[:200]}")
+        
+        for line in result.stdout.strip().split('\n'):
+            try:
+                data = json.loads(line)
+                if "error" not in data:
+                    original = data.get("original", 0)
+                    sale = data.get("sale", 0)
+                    discount = round((1 - sale / original) * 100) if original > sale else 0
+                    return {"original_price": original, "sale_price": sale, "discount_percent": discount}
+            except: pass
     except Exception as e:
-        print(f"خطا در دریافت اطلاعات محصول {product_id}: {e}")
-        return None
-
-
-def parse_api_response(data):
-    try:
-        product = data.get("product", {})
-        price_info = product.get("price", {})
-        original = price_info.get("regularPrice", {}).get("value", 0)
-        sale = price_info.get("salePrice", {}).get("value", 0)
-
-        if original and sale:
-            discount = round((1 - sale / original) * 100)
-            return {
-                "original_price": original,
-                "sale_price": sale,
-                "discount_percent": discount,
-                "name": product.get("name", ""),
-            }
-    except Exception:
-        pass
+        print(f"  خطا: {e}")
     return None
 
 
-def parse_html_response(html, product_id):
-    """استخراج قیمت از HTML با regex ساده"""
-    import re
-
-    # دنبال JSON داخل صفحه می‌گردیم
-    pattern = r'"regularPrice":\s*\{[^}]*"value":\s*([\d.]+)'
-    sale_pattern = r'"salePrice":\s*\{[^}]*"value":\s*([\d.]+)'
-
-    reg_match = re.search(pattern, html)
-    sale_match = re.search(sale_pattern, html)
-
-    if reg_match and sale_match:
-        original = float(reg_match.group(1))
-        sale = float(sale_match.group(1))
-        discount = round((1 - sale / original) * 100)
-        return {
-            "original_price": original,
-            "sale_price": sale,
-            "discount_percent": discount,
-            "name": f"محصول {product_id}",
-        }
-    return None
-
-
-# ═══════════════════════════════════════════
-#  ارسال ایمیل
-# ═══════════════════════════════════════════
 def send_email(product_name, product_url, original_price, sale_price, discount):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🎉 تخفیف {discount}٪ روی {product_name}!"
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECEIVER
-
     html_body = f"""
     <div dir="rtl" style="font-family: Arial; padding: 20px;">
         <h2 style="color: #e53e3e;">🔥 تخفیف بیشتر از {DISCOUNT_THRESHOLD}٪ پیدا شد!</h2>
         <h3>{product_name}</h3>
         <p><b>قیمت اصلی:</b> <s>{original_price:.2f} €</s></p>
-        <p><b>قیمت با تخفیف:</b> <span style="color:green; font-size:1.3em;">{sale_price:.2f} €</span></p>
-        <p><b>میزان تخفیف:</b> <span style="color:red; font-weight:bold;">{discount}٪</span></p>
-        <br>
-        <a href="{product_url}" style="background:#e53e3e; color:white; padding:12px 24px; 
-           text-decoration:none; border-radius:6px;">مشاهده و خرید</a>
-    </div>
-    """
-
+        <p><b>قیمت با تخفیف:</b> <span style="color:green">{sale_price:.2f} €</span></p>
+        <p><b>تخفیف:</b> <span style="color:red">{discount}٪</span></p>
+        <a href="{product_url}" style="background:#e53e3e;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;">مشاهده و خرید</a>
+    </div>"""
     msg.attach(MIMEText(html_body, "html"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+    print(f"✅ ایمیل ارسال شد!")
 
-    print(f"✅ ایمیل ارسال شد! تخفیف {discount}٪ برای {product_name}")
 
-
-# ═══════════════════════════════════════════
-#  اجرای اصلی
-# ═══════════════════════════════════════════
 def main():
     print("🔍 بررسی قیمت‌های H&M...")
-
     for product in PRODUCTS:
-        print(f"\n→ {product['name']} (ID: {product['product_id']})")
-        info = get_product_info(product["product_id"])
-
+        print(f"\n→ {product['name']}")
+        info = get_price(product["url"])
         if not info:
-            print("  ❌ نتوانستم اطلاعات قیمت را دریافت کنم")
+            print("  ❌ نتوانستم قیمت را دریافت کنم")
             continue
-
         print(f"  قیمت اصلی: {info['original_price']:.2f} €")
         print(f"  قیمت فعلی: {info['sale_price']:.2f} €")
         print(f"  تخفیف: {info['discount_percent']}٪")
-
         if info["discount_percent"] >= DISCOUNT_THRESHOLD:
-            print(f"  🎉 تخفیف کافی! در حال ارسال ایمیل...")
-            send_email(
-                product_name=product["name"],
-                product_url=product["url"],
-                original_price=info["original_price"],
-                sale_price=info["sale_price"],
-                discount=info["discount_percent"],
-            )
+            send_email(product["name"], product["url"],
+                      info["original_price"], info["sale_price"], info["discount_percent"])
         else:
-            print(f"  ⏳ تخفیف کافی نیست (نیاز به {DISCOUNT_THRESHOLD}٪+)")
-
+            print(f"  ⏳ تخفیف کافی نیست")
     print("\n✅ بررسی تمام شد.")
-
 
 if __name__ == "__main__":
     main()
